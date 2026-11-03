@@ -183,7 +183,11 @@ async def check_ticker(ticker: str, channel: discord.abc.Messageable) -> None:
 async def monitor() -> None:
     if MARKET_HOURS_ONLY and not is_market_open():
         return
-    channel = client.get_channel(CHANNEL_ID) or await client.fetch_channel(CHANNEL_ID)
+    try:
+        channel = client.get_channel(CHANNEL_ID) or await client.fetch_channel(CHANNEL_ID)
+    except discord.HTTPException as ex:  # 채널 권한 문제여도 루프는 살려두고 다음 주기에 재시도
+        print(f"[{datetime.now(ET):%H:%M}] 알림 채널({CHANNEL_ID})에 접근 못 함: {ex}")
+        return
     for t in list(TICKERS):
         try:
             await check_ticker(t, channel)
