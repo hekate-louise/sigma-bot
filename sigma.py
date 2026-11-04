@@ -9,7 +9,7 @@
 import math
 import warnings
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -132,13 +132,42 @@ def compute_sigma(
     )
 
 
-def is_market_open(now: datetime | None = None) -> bool:
-    """미국 정규장(평일 09:30~16:00 ET) 여부. 공휴일은 고려하지 않음."""
+def current_session(now: datetime | None = None) -> tuple[str | None, date]:
+    """(세션, 세션 날짜). 공휴일은 고려하지 않음.
+
+    pre 04:00~09:30, regular 09:30~16:00, after 16:00~20:00 (평일 ET)
+    day 20:00~04:00 (일요일 밤~금요일 새벽 ET). 자정을 넘겨도 시작한 날짜로 묶는다.
+    """
     now = (now or datetime.now(ET)).astimezone(ET)
-    if now.weekday() >= 5:
-        return False
+    today, weekday = now.date(), now.weekday()
     minutes = now.hour * 60 + now.minute
-    return 9 * 60 + 30 <= minutes < 16 * 60
+    if minutes < 4 * 60:
+        return ("day", today - timedelta(days=1)) if weekday <= 4 else (None, today)
+    if minutes >= 20 * 60:
+        return ("day", today) if weekday in (6, 0, 1, 2, 3) else (None, today)
+    if weekday >= 5:
+        return None, today
+    if minutes < 9 * 60 + 30:
+        return "pre", today
+    return ("regular" if minutes < 16 * 60 else "after"), today
+
+
+def with_live_price(closes: pd.Series, price: float, session: str, now: datetime | None = None) -> pd.Series:
+    """종가 시리즈 끝에 실시간 가격을 '오늘' 행으로 붙인다.
+
+    기준가(직전 행): 프리장·정규장·새벽 주간거래는 직전 거래일 종가,
+    애프터장·저녁 주간거래는 그날 정규장 종가.
+    """
+    now = (now or datetime.now(ET)).astimezone(ET)
+    today = now.date()
+    dates = closes.index.date
+    if session == "after" or (session == "day" and now.hour >= 20):
+        base = closes[dates <= today]
+        if session == "after" and base.index[-1].date() != today:
+            raise RuntimeError("오늘 정규장 종가가 아직 없습니다 (휴장일일 수 있음)")
+    else:
+        base = closes[dates < today]
+    return pd.concat([base, pd.Series([price], index=[pd.Timestamp(today, tz=closes.index.tz)])])
 
 
 if __name__ == "__main__":

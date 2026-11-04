@@ -2,3 +2,5 @@
 __pycache__/
 *.pyc
 *_chart.png
+.kis_token.json
+*.log

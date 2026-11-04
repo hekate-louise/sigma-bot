@@ -10,6 +10,7 @@ import asyncio
 import io
 import json
 import os
+import sys
 from datetime import date, datetime
 from pathlib import Path
 
@@ -18,8 +19,9 @@ from discord import app_commands
 from discord.ext import tasks
 from dotenv import load_dotenv
 
+import kis
 from chart import make_chart
-from sigma import ET, SigmaResult, compute_sigma, get_closes, is_market_open
+from sigma import ET, SigmaResult, compute_sigma, current_session, get_closes, with_live_price
 from stats import HORIZON_NAMES, event_stats
 
 load_dotenv()
@@ -34,6 +36,10 @@ THRESHOLD = int(os.getenv("SIGMA_THRESHOLD", "1"))
 INTERVAL = float(os.getenv("CHECK_INTERVAL_MIN", "5"))
 ALERT_ROLE_ID = os.getenv("ALERT_ROLE_ID")  # 비워두면 멘션 없음
 MARKET_HOURS_ONLY = os.getenv("MARKET_HOURS_ONLY", "true").lower() == "true"
+# 프리장·애프터장·주간거래까지 알릴 종목 (KIS 키 필요). 나머지는 정규장만
+EXTENDED_TICKERS = [t.strip().upper() for t in os.getenv("EXTENDED_TICKERS", "QQQ").split(",") if t.strip()]
+SESSION_NAMES = {"pre": "프리장", "regular": "정규장", "after": "애프터장", "day": "주간거래"}
+YAHOO_SOURCE = "Yahoo Finance · 무료 시세는 지연될 수 있음"
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
@@ -41,6 +47,8 @@ tree = app_commands.CommandTree(client)
 
 # {(날짜, 티커, 종류, 방향): 이미 알린 최고 시그마 단계}  종류: "1d", "3d", "5d" ...
 alerted: dict[tuple, int] = {}
+# {(세션 날짜, 세션, 티커): 세션에서 처음 본 가격} - 세션 시작 직후 지난 세션 값으로 잘못 알리지 않기 위함
+first_seen: dict[tuple, float] = {}
 
 # /period, /watch 로 바꾼 값은 settings.json 에 저장해 재시작 후에도 유지 (.env 값보다 우선)
 SETTINGS_FILE = Path(__file__).with_name("settings.json")
@@ -80,7 +88,12 @@ LOC_SIGMA = 2  # /sigma 에 보여줄 LOC 참고가의 σ 단계
 
 
 def make_embed(
-    r: SigmaResult, title: str, lookback: int, show_loc: bool = False, past: bool = False
+    r: SigmaResult,
+    title: str,
+    lookback: int,
+    show_loc: bool = False,
+    past: bool = False,
+    source: str = YAHOO_SOURCE,
 ) -> discord.Embed:
     """past=True 면 지난 날짜 조회: 현재가 대신 종가, LOC 체결 여부 표시"""
     lo1, hi1 = r.band(1)
@@ -113,7 +126,7 @@ def make_embed(
             ),
             inline=False,
         )
-    e.set_footer(text="Yahoo Finance · 무료 시세는 지연될 수 있음")
+    e.set_footer(text=source)
     return e
 
 
@@ -141,25 +154,60 @@ async def send_alert(
     await channel.send(content=mention, embed=embed, file=file)
 
 
-def should_alert(kind: str, ticker: str, z: float) -> bool:
+def should_alert(kind: str, ticker: str, z: float, day: date | None = None) -> bool:
     """처음 도달한 단계면 True 를 돌려주고 기록"""
     level = int(abs(z))
     if level < THRESHOLD:
         return False
-    key = (datetime.now(ET).date(), ticker, kind, "up" if z > 0 else "down")
+    key = (day or datetime.now(ET).date(), ticker, kind, "up" if z > 0 else "down")
     if alerted.get(key, 0) >= level:
         return False  # 이미 이 단계(또는 그 이상)를 알렸음
     alerted[key] = level
     return True
 
 
-async def check_ticker(ticker: str, channel: discord.abc.Messageable) -> None:
+def kis_source(session: str) -> str:
+    return f"한국투자증권 현재가 ({SESSION_NAMES[session]}) · σ는 Yahoo 일봉 기준"
+
+
+async def live_series(ticker: str, closes, session: str | None) -> tuple:
+    """(실시간 가격을 붙인 종가, 출처). KIS를 못 쓰면 정규장·장외 조회는 Yahoo 값 그대로."""
+    if session is None or not kis.supports(ticker):
+        return closes, YAHOO_SOURCE
+    quote = await asyncio.to_thread(kis.get_quote, ticker, session)
+    return with_live_price(closes, quote.price, session), kis_source(session)
+
+
+async def check_extended(ticker: str, channel: discord.abc.Messageable, session: str, day: date) -> None:
+    """프리장·애프터장·주간거래: 하루 변동 알림만 보내고, 세션별로 따로 기록한다."""
+    quote = await asyncio.to_thread(kis.get_quote, ticker, session)
+    # 세션 시작 직후엔 지난 세션의 마지막 값이 나올 수 있어 가격이 한 번 바뀐 뒤부터 본다
+    key = (day, session, ticker)
+    if first_seen.setdefault(key, quote.price) == quote.price:
+        return
     closes = await asyncio.to_thread(get_closes, ticker)
-    r = compute_sigma(ticker, LOOKBACK, CUMULATIVE_DAYS, closes)
+    series = with_live_price(closes, quote.price, session)
+    r = compute_sigma(ticker, LOOKBACK, (), series)
+    if should_alert(f"1d:{session}", ticker, r.z, day):
+        direction = "상승" if r.z > 0 else "하락"
+        name = SESSION_NAMES[session]
+        embed = make_embed(r, f"⚠️ [{name}] {ticker} {r.level}σ {direction} 이탈", LOOKBACK, source=kis_source(session))
+        embed.description = f"{name} 시세는 거래량이 적어 정규장보다 크게 튈 수 있어요."
+        await send_alert(channel, ticker, closes, embed, r.level, r.z < 0)
+
+
+async def check_ticker(ticker: str, channel: discord.abc.Messageable, session: str | None = None) -> None:
+    closes = await asyncio.to_thread(get_closes, ticker)
+    try:
+        series, source = await live_series(ticker, closes, session)
+    except Exception as ex:  # KIS 장애 시 Yahoo 값으로 계속 감시
+        print(f"[{datetime.now(ET):%H:%M}] {ticker} KIS 실패, Yahoo 사용: {ex}")
+        series, source = closes, YAHOO_SOURCE
+    r = compute_sigma(ticker, LOOKBACK, CUMULATIVE_DAYS, series)
 
     if should_alert("1d", ticker, r.z):
         direction = "상승" if r.z > 0 else "하락"
-        embed = make_embed(r, f"⚠️ {ticker} {r.level}σ {direction} 이탈", LOOKBACK)
+        embed = make_embed(r, f"⚠️ {ticker} {r.level}σ {direction} 이탈", LOOKBACK, source=source)
         await send_alert(channel, ticker, closes, embed, r.level, r.z < 0)
 
     for c in r.cumulative:
@@ -170,7 +218,7 @@ async def check_ticker(ticker: str, channel: discord.abc.Messageable) -> None:
         if not should_alert(f"{c.days}d", ticker, c.z):
             continue
         direction = "상승" if c.z > 0 else "하락"
-        embed = make_embed(r, f"⚠️ {ticker} {c.days}일 누적 {c.level}σ {direction}", LOOKBACK)
+        embed = make_embed(r, f"⚠️ {ticker} {c.days}일 누적 {c.level}σ {direction}", LOOKBACK, source=source)
         embed.description = (
             f"{c.days}거래일 동안 {c.change_pct:+.2f}% "
             f"({c.days}일 기준 1σ = ±{c.sigma_pct:.2f}%)"
@@ -181,8 +229,14 @@ async def check_ticker(ticker: str, channel: discord.abc.Messageable) -> None:
 
 @tasks.loop(minutes=INTERVAL)
 async def monitor() -> None:
-    if MARKET_HOURS_ONLY and not is_market_open():
+    session, day = current_session()
+    extended = session in ("pre", "after", "day")
+    if MARKET_HOURS_ONLY and session is None:
         return
+    if extended and not kis.enabled():
+        if MARKET_HOURS_ONLY:
+            return
+        session, extended = None, False
     try:
         channel = client.get_channel(CHANNEL_ID) or await client.fetch_channel(CHANNEL_ID)
     except discord.HTTPException as ex:  # 채널 권한 문제여도 루프는 살려두고 다음 주기에 재시도
@@ -190,7 +244,10 @@ async def monitor() -> None:
         return
     for t in list(TICKERS):
         try:
-            await check_ticker(t, channel)
+            if not extended:
+                await check_ticker(t, channel, session)
+            elif t in EXTENDED_TICKERS and kis.supports(t):
+                await check_extended(t, channel, session, day)
         except Exception as ex:  # 한 종목 실패가 루프 전체를 멈추지 않도록
             print(f"[{datetime.now(ET):%H:%M}] {t} 확인 실패: {ex}")
 
@@ -233,8 +290,17 @@ async def sigma_cmd(
 
     await interaction.response.defer()
     lookback = days or LOOKBACK
+    ticker = ticker.upper()
+    session = current_session()[0]
+    source = YAHOO_SOURCE
     try:
-        r = await asyncio.to_thread(compute_sigma, ticker.upper(), lookback, CUMULATIVE_DAYS, None, on)
+        closes = await asyncio.to_thread(get_closes, ticker)
+        if on is None:  # 현재 조회만 KIS 실시간 가격 사용
+            try:
+                closes, source = await live_series(ticker, closes, session)
+            except Exception as ex:
+                print(f"[{datetime.now(ET):%H:%M}] {ticker} KIS 실패, Yahoo 사용: {ex}")
+        r = await asyncio.to_thread(compute_sigma, ticker, lookback, CUMULATIVE_DAYS, closes, on)
     except Exception as ex:
         await interaction.followup.send(f"조회 실패: {ex}")
         return
@@ -247,7 +313,9 @@ async def sigma_cmd(
             title += f" · {on:%m/%d}은 휴장일이라 직전 거래일"
     else:
         title = f"{r.ticker} 시그마 현황"
-    await interaction.followup.send(embed=make_embed(r, title, lookback, show_loc=True, past=past))
+        if source != YAHOO_SOURCE:
+            title += f" ({SESSION_NAMES[session]})"
+    await interaction.followup.send(embed=make_embed(r, title, lookback, show_loc=True, past=past, source=source))
 
 
 @tree.command(name="stats", description="과거에 Nσ 이상 움직인 날 이후 주가가 어땠는지 자세히 보기")
@@ -415,4 +483,6 @@ async def on_ready() -> None:
 
 
 if __name__ == "__main__":
+    if sys.stdout is None:  # pythonw(창 없이 자동 실행)로 켜면 출력을 파일에 남긴다
+        sys.stdout = sys.stderr = open(Path(__file__).with_name("bot.log"), "a", encoding="utf-8", buffering=1)
     client.run(TOKEN)
