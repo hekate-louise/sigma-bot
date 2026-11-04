@@ -1,10 +1,10 @@
 """QQQ(나스닥) 시그마 이탈 경고 디스코드 봇.
 
-장중 CHECK_INTERVAL_MIN 분마다 시세를 확인해
-  - 전일 대비 변동이 1σ, 2σ, 3σ ... 를 처음 넘을 때
-  - N일 누적 변동이 Nσ를 처음 넘을 때 (하루 변동 알림보다 높은 단계일 때만)
+장중 CHECK_INTERVAL_MIN 분마다 시세를 확인해 하락만 알린다.
+  - 전일 대비 하락이 2σ, 3σ ... 를 처음 넘을 때
+  - 3일 누적 하락이 2σ, 3σ ... 를 처음 넘을 때 (하루 변동 알림보다 높은 단계일 때만)
 채널에 경고(과거 통계 한 줄 + 차트)를 보낸다.
-같은 날 같은 종류·방향·단계 알림은 한 번만 보낸다.
+같은 날 같은 종류·단계 알림은 한 번만 보낸다.
 """
 import asyncio
 import io
@@ -31,8 +31,10 @@ CHANNEL_ID = int(os.environ["CHANNEL_ID"])
 TICKERS = [t.strip().upper() for t in os.getenv("TICKERS", "QQQ").split(",") if t.strip()]
 LOOKBACK = int(os.getenv("LOOKBACK_DAYS", "252"))
 MIN_LOOKBACK, MAX_LOOKBACK = 5, 1000  # 1000거래일 ≈ 4년 (시세는 10년치 조회)
-CUMULATIVE_DAYS = tuple(int(d) for d in os.getenv("CUMULATIVE_DAYS", "3,5").split(",") if d.strip())
-THRESHOLD = int(os.getenv("SIGMA_THRESHOLD", "1"))
+CUMULATIVE_DAYS = tuple(int(d) for d in os.getenv("CUMULATIVE_DAYS", "3,5").split(",") if d.strip())  # 화면 표시용
+# CUMULATIVE_DAYS 중 자동 알림까지 보낼 기간
+ALERT_CUMULATIVE_DAYS = tuple(int(d) for d in os.getenv("ALERT_CUMULATIVE_DAYS", "3").split(",") if d.strip())
+THRESHOLD = int(os.getenv("SIGMA_THRESHOLD", "2"))
 INTERVAL = float(os.getenv("CHECK_INTERVAL_MIN", "5"))
 ALERT_ROLE_ID = os.getenv("ALERT_ROLE_ID")  # 비워두면 멘션 없음
 MARKET_HOURS_ONLY = os.getenv("MARKET_HOURS_ONLY", "true").lower() == "true"
@@ -45,7 +47,7 @@ intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
-# {(날짜, 티커, 종류, 방향): 이미 알린 최고 시그마 단계}  종류: "1d", "3d", "5d" ...
+# {(날짜, 티커, 종류): 이미 알린 최고 시그마 단계}  종류: "1d", "3d", "1d:pre" ...
 alerted: dict[tuple, int] = {}
 # {(세션 날짜, 세션, 티커): 세션에서 처음 본 가격} - 세션 시작 직후 지난 세션 값으로 잘못 알리지 않기 위함
 first_seen: dict[tuple, float] = {}
@@ -136,11 +138,10 @@ async def send_alert(
     closes,
     embed: discord.Embed,
     level: int,
-    down: bool,
     window: int = 1,
 ) -> None:
     """경고 공통: 과거 통계 한 줄 + 차트 첨부"""
-    s = await asyncio.to_thread(event_stats, ticker, closes, LOOKBACK, level, down, window)
+    s = await asyncio.to_thread(event_stats, ticker, closes, LOOKBACK, level, True, window)
     what = "하루" if window == 1 else f"{window}일 누적"
     cmd = f"/stats ticker:{ticker} level:{level}" + ("" if window == 1 else f" window:{window}")
     embed.add_field(
@@ -155,11 +156,11 @@ async def send_alert(
 
 
 def should_alert(kind: str, ticker: str, z: float, day: date | None = None) -> bool:
-    """처음 도달한 단계면 True 를 돌려주고 기록"""
+    """하락이 처음 도달한 단계면 True 를 돌려주고 기록 (상승은 알리지 않음)"""
     level = int(abs(z))
-    if level < THRESHOLD:
+    if z >= 0 or level < THRESHOLD:
         return False
-    key = (day or datetime.now(ET).date(), ticker, kind, "up" if z > 0 else "down")
+    key = (day or datetime.now(ET).date(), ticker, kind)
     if alerted.get(key, 0) >= level:
         return False  # 이미 이 단계(또는 그 이상)를 알렸음
     alerted[key] = level
@@ -189,11 +190,10 @@ async def check_extended(ticker: str, channel: discord.abc.Messageable, session:
     series = with_live_price(closes, quote.price, session)
     r = compute_sigma(ticker, LOOKBACK, (), series)
     if should_alert(f"1d:{session}", ticker, r.z, day):
-        direction = "상승" if r.z > 0 else "하락"
         name = SESSION_NAMES[session]
-        embed = make_embed(r, f"⚠️ [{name}] {ticker} {r.level}σ {direction} 이탈", LOOKBACK, source=kis_source(session))
+        embed = make_embed(r, f"⚠️ [{name}] {ticker} {r.level}σ 하락 이탈", LOOKBACK, source=kis_source(session))
         embed.description = f"{name} 시세는 거래량이 적어 정규장보다 크게 튈 수 있어요."
-        await send_alert(channel, ticker, closes, embed, r.level, r.z < 0)
+        await send_alert(channel, ticker, closes, embed, r.level)
 
 
 async def check_ticker(ticker: str, channel: discord.abc.Messageable, session: str | None = None) -> None:
@@ -206,25 +206,24 @@ async def check_ticker(ticker: str, channel: discord.abc.Messageable, session: s
     r = compute_sigma(ticker, LOOKBACK, CUMULATIVE_DAYS, series)
 
     if should_alert("1d", ticker, r.z):
-        direction = "상승" if r.z > 0 else "하락"
-        embed = make_embed(r, f"⚠️ {ticker} {r.level}σ {direction} 이탈", LOOKBACK, source=source)
-        await send_alert(channel, ticker, closes, embed, r.level, r.z < 0)
+        embed = make_embed(r, f"⚠️ {ticker} {r.level}σ 하락 이탈", LOOKBACK, source=source)
+        await send_alert(channel, ticker, closes, embed, r.level)
 
     for c in r.cumulative:
-        # 하루 변동만으로 이미 같은 단계 이상이면 누적 알림은 중복이므로 생략
-        same_side = (c.z > 0) == (r.z > 0)
-        if same_side and r.level >= c.level:
+        if c.days not in ALERT_CUMULATIVE_DAYS:
+            continue
+        # 하루 하락만으로 이미 같은 단계 이상이면 누적 알림은 중복이므로 생략
+        if r.z < 0 and r.level >= c.level:
             continue
         if not should_alert(f"{c.days}d", ticker, c.z):
             continue
-        direction = "상승" if c.z > 0 else "하락"
-        embed = make_embed(r, f"⚠️ {ticker} {c.days}일 누적 {c.level}σ {direction}", LOOKBACK, source=source)
+        embed = make_embed(r, f"⚠️ {ticker} {c.days}일 누적 {c.level}σ 하락", LOOKBACK, source=source)
         embed.description = (
             f"{c.days}거래일 동안 {c.change_pct:+.2f}% "
             f"({c.days}일 기준 1σ = ±{c.sigma_pct:.2f}%)"
         )
         embed.color = level_color(c.level)
-        await send_alert(channel, ticker, closes, embed, c.level, c.z < 0, c.days)
+        await send_alert(channel, ticker, closes, embed, c.level, c.days)
 
 
 @tasks.loop(minutes=INTERVAL)
@@ -476,7 +475,7 @@ async def on_ready() -> None:
     await tree.sync()
     print(
         f"로그인: {client.user} | 감시: {TICKERS} | σ 기간 {LOOKBACK}거래일 | "
-        f"누적 {CUMULATIVE_DAYS}일 | {THRESHOLD}σ 이상 | {INTERVAL}분 간격"
+        f"누적 알림 {ALERT_CUMULATIVE_DAYS}일 | {THRESHOLD}σ 이상 하락만 | {INTERVAL}분 간격"
     )
     if not monitor.is_running():
         monitor.start()
